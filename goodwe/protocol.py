@@ -411,9 +411,22 @@ class DtlsInverterProtocol(UdpInverterProtocol):
         self._socat_proc: asyncio.subprocess.Process | None = None
         self._local_port = self._find_free_udp_port()
         self._socat_terminated_at: float = 0.0
+        self._socat_start_lock: asyncio.Lock | None = None
         # Connect the parent UDP protocol to the local socat proxy, keep socket alive
         super().__init__('127.0.0.1', self._local_port, comm_addr, timeout, retries)
-        self.keep_alive = True
+
+    # keep_alive must always be True for DTLS: execute() must never call close()
+    # between requests, because close() terminates socat and causes all queued
+    # coroutines to see _socat_proc=None simultaneously and spawn multiple instances.
+    # Inverter.set_keep_alive() sets self._protocol.keep_alive — the property
+    # intercepts that write and keeps the value locked to True.
+    @property
+    def keep_alive(self) -> bool:
+        return True
+
+    @keep_alive.setter
+    def keep_alive(self, value: bool) -> None:
+        pass  # ignore — socat lifecycle is managed internally
 
     @staticmethod
     def _find_free_udp_port() -> int:
@@ -438,39 +451,50 @@ class DtlsInverterProtocol(UdpInverterProtocol):
             # Reap the process so it doesn't become a zombie.
             asyncio.get_running_loop().create_task(proc.wait())
 
+    def _ensure_socat_lock(self) -> asyncio.Lock:
+        if self._socat_start_lock is None:
+            self._socat_start_lock = asyncio.Lock()
+        return self._socat_start_lock
+
     async def _start_socat(self) -> None:
-        """Start socat DTLS proxy and wait for it to bind to the local UDP port."""
+        """Start socat DTLS proxy, serialized so only one instance starts at a time."""
+        # Quick check before acquiring the lock (common fast path).
         if self._socat_running():
             return
-        # Honour the dongle session cooldown — if a previous DTLS session was
-        # just torn down, wait before opening a new one so the dongle has time
-        # to release the session and stop responding @busy on port 48899.
-        elapsed = asyncio.get_running_loop().time() - self._socat_terminated_at
-        if elapsed < self.DONGLE_SESSION_COOLDOWN:
-            await asyncio.sleep(self.DONGLE_SESSION_COOLDOWN - elapsed)
-        # rcvtimeo must be >= the inverter timeout so socat stays alive long enough
-        # for HA's retry loop to fire before socat exits and closes the port.
-        rcvtimeo = max(self.timeout, 2)
-        socat_cmd = [
-            'socat',
-            '-T120',   # exit after 120s of inactivity
-            '-b', '2000',
-            f'UDP-LISTEN:{self._local_port},reuseaddr',
-            (
-                f'OPENSSL-DTLS-CLIENT:{self._dtls_host}:{self._dtls_port},'
-                f'verify=0,no-sni,'
-                f'ciphers={self.DTLS_CIPHER},'
-                f'openssl-min-proto-version=DTLS1.2,'
-                f'rcvtimeo={rcvtimeo}'
-            ),
-        ]
-        logger.debug('Starting socat DTLS proxy: %s', ' '.join(socat_cmd))
-        self._socat_proc = await asyncio.create_subprocess_exec(
-            *socat_cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await asyncio.sleep(self.SOCAT_STARTUP_DELAY)
+        async with self._ensure_socat_lock():
+            # Re-check under the lock: another coroutine may have started socat
+            # while we were waiting.
+            if self._socat_running():
+                return
+            # Honour the dongle session cooldown — if a previous DTLS session was
+            # just torn down, wait before opening a new one so the dongle has time
+            # to release the session and stop responding @busy on port 48899.
+            elapsed = asyncio.get_running_loop().time() - self._socat_terminated_at
+            if elapsed < self.DONGLE_SESSION_COOLDOWN:
+                await asyncio.sleep(self.DONGLE_SESSION_COOLDOWN - elapsed)
+            # rcvtimeo must be >= the inverter timeout so socat stays alive long enough
+            # for HA's retry loop to fire before socat exits and closes the port.
+            rcvtimeo = max(self.timeout, 2)
+            socat_cmd = [
+                'socat',
+                '-T120',   # exit after 120s of inactivity
+                '-b', '2000',
+                f'UDP-LISTEN:{self._local_port},reuseaddr',
+                (
+                    f'OPENSSL-DTLS-CLIENT:{self._dtls_host}:{self._dtls_port},'
+                    f'verify=0,no-sni,'
+                    f'ciphers={self.DTLS_CIPHER},'
+                    f'openssl-min-proto-version=DTLS1.2,'
+                    f'rcvtimeo={rcvtimeo}'
+                ),
+            ]
+            logger.debug('Starting socat DTLS proxy: %s', ' '.join(socat_cmd))
+            self._socat_proc = await asyncio.create_subprocess_exec(
+                *socat_cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.sleep(self.SOCAT_STARTUP_DELAY)
 
     def error_received(self, exc: Exception) -> None:
         """Handle transport errors — on ConnectionRefusedError terminate socat and trigger retry.

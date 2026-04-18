@@ -173,7 +173,7 @@ async def connect(
             )
         dtls_port = disc.get("dtls_port", port)
         dtls_timeout = max(timeout, 10)
-        dtls_retries = max(retries, 5)
+        dtls_retries = min(max(retries, 1), 3)
         inv._protocol = DtlsInverterProtocol(host, dtls_port, comm_addr, dtls_timeout, dtls_retries)
         logger.debug("Connecting to %s family inverter via DTLS at %s:%s.", family, host, dtls_port)
     else:
@@ -210,7 +210,7 @@ async def discover(
 
         # Use a longer timeout for DTLS: first request triggers the handshake (~2-3s)
         dtls_timeout = max(timeout, 10)
-        dtls_retries = max(retries, 5)
+        dtls_retries = min(max(retries, 1), 3)
 
         inv = _inverter_from_serial(serial, host, dtls_port, 0, dtls_timeout, dtls_retries, dtls=True)
         if inv is not None:
