@@ -426,13 +426,19 @@ class DtlsInverterProtocol(UdpInverterProtocol):
 
     def _terminate_socat(self) -> None:
         if self._socat_proc is not None:
-            self._socat_proc.terminate()
+            proc = self._socat_proc
             self._socat_proc = None
+            proc.terminate()
+            # Reap the process so it doesn't become a zombie.
+            asyncio.get_running_loop().create_task(proc.wait())
 
     async def _start_socat(self) -> None:
         """Start socat DTLS proxy and wait for it to bind to the local UDP port."""
         if self._socat_running():
             return
+        # rcvtimeo must be >= the inverter timeout so socat stays alive long enough
+        # for HA's retry loop to fire before socat exits and closes the port.
+        rcvtimeo = max(self.timeout, 2)
         socat_cmd = [
             'socat',
             '-T120',   # exit after 120s of inactivity
@@ -443,7 +449,7 @@ class DtlsInverterProtocol(UdpInverterProtocol):
                 f'verify=0,no-sni,'
                 f'ciphers={self.DTLS_CIPHER},'
                 f'openssl-min-proto-version=DTLS1.2,'
-                f'rcvtimeo=1'
+                f'rcvtimeo={rcvtimeo}'
             ),
         ]
         logger.debug('Starting socat DTLS proxy: %s', ' '.join(socat_cmd))
@@ -548,6 +554,11 @@ class ProtocolCommand:
         Return ProtocolResponse with raw response data
         """
         try:
+            # Reset retry counter so each fresh execute() starts at attempt #0,
+            # preventing bleed-through from a previous command that was cancelled
+            # mid-retry without going through _max_retries_reached().
+            if hasattr(protocol, '_retry'):
+                protocol._retry = 0
             response_future = await protocol.send_request(self)
             result = response_future.result()
             if result is not None:
