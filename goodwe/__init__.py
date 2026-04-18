@@ -141,7 +141,22 @@ async def connect(
     else:
         raise InverterError("Specify either an inverter family or set do_discover True")
 
-    logger.debug("Connecting to %s family inverter at %s:%s.", family, host, port)
+    # Probe 48899 even when family is known — dongle may require DTLS
+    disc = await _probe_48899(host, timeout=max(timeout, 3))
+    if disc and disc.get("dtls"):
+        if not DtlsInverterProtocol.is_available():
+            raise InverterError(
+                "Inverter uses DTLS encryption (WiFi/LAN Kit 2.0) but 'socat' is not installed. "
+                "Install socat (e.g. 'apt install socat' or 'brew install socat') and retry."
+            )
+        dtls_port = disc.get("dtls_port", port)
+        dtls_timeout = max(timeout, 10)
+        dtls_retries = max(retries, 5)
+        inv._protocol = DtlsInverterProtocol(host, dtls_port, comm_addr, dtls_timeout, dtls_retries)
+        logger.debug("Connecting to %s family inverter via DTLS at %s:%s.", family, host, dtls_port)
+    else:
+        logger.debug("Connecting to %s family inverter at %s:%s.", family, host, port)
+
     await inv.read_device_info()
     logger.debug("Connected to inverter %s, S/N:%s.", inv.model_name, inv.serial_number)
     return inv
