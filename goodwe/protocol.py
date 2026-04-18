@@ -5,7 +5,10 @@ import asyncio
 import io
 import logging
 import platform
+import shutil
 import socket
+import subprocess
+import time
 from asyncio.futures import Future
 from typing import Optional, Callable
 
@@ -65,6 +68,7 @@ class InverterProtocol:
     def _max_retries_reached(self) -> Future:
         logger.debug("Max number of retries (%d) reached, request %s failed.", self.retries, self.command)
         self._close_transport()
+        self._retry = 0  # reset so the next distinct command starts fresh
         self.response_future = asyncio.get_running_loop().create_future()
         self.response_future.set_exception(MaxRetriesException)
         return self.response_future
@@ -384,6 +388,101 @@ class TcpInverterProtocol(InverterProtocol, asyncio.Protocol):
         finally:
             if self._lock and self._lock.locked():
                 self._lock.release()
+
+
+class DtlsInverterProtocol(UdpInverterProtocol):
+    """DTLS-encrypted UDP protocol for WiFi/LAN Kit 2.0 (Cyber Security) dongles.
+
+    Uses socat as a local DTLS↔plain-UDP proxy since Python has no native async DTLS.
+    The underlying GoodWe Modbus RTU framing is identical to plain UDP — only the
+    transport layer is encrypted with DTLSv1.2.
+
+    Requires socat to be installed on the system (apt install socat / brew install socat).
+    """
+
+    DTLS_CIPHER = 'ECDHE-RSA-AES128-GCM-SHA256'
+    SOCAT_STARTUP_DELAY = 0.5  # seconds to wait for socat to bind
+
+    def __init__(self, host: str, port: int, comm_addr: int, timeout: int = 1, retries: int = 3):
+        self._dtls_host = host
+        self._dtls_port = port
+        self._socat_proc: subprocess.Popen | None = None
+        self._local_port = self._find_free_udp_port()
+        # Connect the parent UDP protocol to the local socat proxy, keep socket alive
+        super().__init__('127.0.0.1', self._local_port, comm_addr, timeout, retries)
+        self.keep_alive = True
+
+    @staticmethod
+    def _find_free_udp_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.bind(('', 0))
+            return s.getsockname()[1]
+
+    @staticmethod
+    def is_available() -> bool:
+        """Return True if socat is installed and supports DTLS."""
+        return shutil.which('socat') is not None
+
+    def _start_socat(self) -> None:
+        if self._socat_proc and self._socat_proc.poll() is None:
+            return
+        socat_cmd = [
+            'socat',
+            '-T120',   # exit after 120s of inactivity
+            '-b', '2000',
+            f'UDP-LISTEN:{self._local_port},reuseaddr',
+            (
+                f'OPENSSL-DTLS-CLIENT:{self._dtls_host}:{self._dtls_port},'
+                f'verify=0,no-sni,'
+                f'ciphers={self.DTLS_CIPHER},'
+                f'openssl-min-proto-version=DTLS1.2,'
+                f'rcvtimeo=1'
+            ),
+        ]
+        logger.debug('Starting socat DTLS proxy: %s', ' '.join(socat_cmd))
+        self._socat_proc = subprocess.Popen(
+            socat_cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(self.SOCAT_STARTUP_DELAY)
+
+    def _socat_running(self) -> bool:
+        return self._socat_proc is not None and self._socat_proc.poll() is None
+
+    def error_received(self, exc: Exception) -> None:
+        """Handle transport errors — restart socat on ConnectionRefusedError and trigger retry.
+
+        ConnectionRefusedError means nothing is listening on the local socat port, either because
+        socat exited (DTLS session closed by inverter) or because the transport was recycled and
+        socat's UDP-LISTEN is still bound to the old source port. Always restart socat in this case.
+        """
+        if isinstance(exc, ConnectionRefusedError):
+            logger.debug('DTLS proxy connection refused, restarting socat for retry.')
+            # Terminate old socat regardless of poll() status (race condition: may not have exited yet)
+            if self._socat_proc is not None:
+                self._socat_proc.terminate()
+                self._socat_proc = None
+            self._start_socat()
+            # Cancel the pending future so UdpInverterProtocol's retry loop kicks in
+            if self.response_future and not self.response_future.done():
+                self.response_future.cancel()
+            self._close_transport()
+        else:
+            super().error_received(exc)
+
+    async def send_request(self, command: ProtocolCommand) -> Future:
+        if not self._socat_running():
+            logger.debug('DTLS proxy not running, (re)starting socat.')
+            self._start_socat()
+        return await super().send_request(command)
+
+    async def close(self) -> None:
+        if self._socat_running():
+            logger.debug('Terminating socat DTLS proxy.')
+            self._socat_proc.terminate()
+            self._socat_proc = None
+        await super().close()
 
 
 class ProtocolResponse:
