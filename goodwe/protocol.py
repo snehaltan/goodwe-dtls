@@ -7,8 +7,6 @@ import logging
 import platform
 import shutil
 import socket
-import subprocess
-import time
 from asyncio.futures import Future
 from typing import Optional, Callable
 
@@ -401,12 +399,12 @@ class DtlsInverterProtocol(UdpInverterProtocol):
     """
 
     DTLS_CIPHER = 'ECDHE-RSA-AES128-GCM-SHA256'
-    SOCAT_STARTUP_DELAY = 0.5  # seconds to wait for socat to bind
+    SOCAT_STARTUP_DELAY = 0.5  # seconds to wait for socat to bind its UDP port
 
     def __init__(self, host: str, port: int, comm_addr: int, timeout: int = 1, retries: int = 3):
         self._dtls_host = host
         self._dtls_port = port
-        self._socat_proc: subprocess.Popen | None = None
+        self._socat_proc: asyncio.subprocess.Process | None = None
         self._local_port = self._find_free_udp_port()
         # Connect the parent UDP protocol to the local socat proxy, keep socket alive
         super().__init__('127.0.0.1', self._local_port, comm_addr, timeout, retries)
@@ -420,11 +418,20 @@ class DtlsInverterProtocol(UdpInverterProtocol):
 
     @staticmethod
     def is_available() -> bool:
-        """Return True if socat is installed and supports DTLS."""
+        """Return True if socat is installed on the system."""
         return shutil.which('socat') is not None
 
-    def _start_socat(self) -> None:
-        if self._socat_proc and self._socat_proc.poll() is None:
+    def _socat_running(self) -> bool:
+        return self._socat_proc is not None and self._socat_proc.returncode is None
+
+    def _terminate_socat(self) -> None:
+        if self._socat_proc is not None:
+            self._socat_proc.terminate()
+            self._socat_proc = None
+
+    async def _start_socat(self) -> None:
+        """Start socat DTLS proxy and wait for it to bind to the local UDP port."""
+        if self._socat_running():
             return
         socat_cmd = [
             'socat',
@@ -440,31 +447,24 @@ class DtlsInverterProtocol(UdpInverterProtocol):
             ),
         ]
         logger.debug('Starting socat DTLS proxy: %s', ' '.join(socat_cmd))
-        self._socat_proc = subprocess.Popen(
-            socat_cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        self._socat_proc = await asyncio.create_subprocess_exec(
+            *socat_cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
         )
-        time.sleep(self.SOCAT_STARTUP_DELAY)
-
-    def _socat_running(self) -> bool:
-        return self._socat_proc is not None and self._socat_proc.poll() is None
+        await asyncio.sleep(self.SOCAT_STARTUP_DELAY)
 
     def error_received(self, exc: Exception) -> None:
-        """Handle transport errors — restart socat on ConnectionRefusedError and trigger retry.
+        """Handle transport errors — on ConnectionRefusedError terminate socat and trigger retry.
 
-        ConnectionRefusedError means nothing is listening on the local socat port, either because
-        socat exited (DTLS session closed by inverter) or because the transport was recycled and
-        socat's UDP-LISTEN is still bound to the old source port. Always restart socat in this case.
+        socat exits when the DTLS session is closed by the inverter. The next send_request
+        call (retry) will detect socat is gone and restart it via _start_socat().
         """
         if isinstance(exc, ConnectionRefusedError):
-            logger.debug('DTLS proxy connection refused, restarting socat for retry.')
-            # Terminate old socat regardless of poll() status (race condition: may not have exited yet)
-            if self._socat_proc is not None:
-                self._socat_proc.terminate()
-                self._socat_proc = None
-            self._start_socat()
-            # Cancel the pending future so UdpInverterProtocol's retry loop kicks in
+            logger.debug('DTLS proxy connection refused, terminating socat for restart on retry.')
+            self._terminate_socat()
+            # Cancel the pending future so UdpInverterProtocol's retry loop kicks in.
+            # send_request will restart socat before the next attempt.
             if self.response_future and not self.response_future.done():
                 self.response_future.cancel()
             self._close_transport()
@@ -474,14 +474,13 @@ class DtlsInverterProtocol(UdpInverterProtocol):
     async def send_request(self, command: ProtocolCommand) -> Future:
         if not self._socat_running():
             logger.debug('DTLS proxy not running, (re)starting socat.')
-            self._start_socat()
+            await self._start_socat()
         return await super().send_request(command)
 
     async def close(self) -> None:
         if self._socat_running():
             logger.debug('Terminating socat DTLS proxy.')
-            self._socat_proc.terminate()
-            self._socat_proc = None
+            self._terminate_socat()
         await super().close()
 
 
