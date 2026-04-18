@@ -36,8 +36,10 @@ def _parse_48899_response(raw: bytes) -> dict:
 
     Legacy dongles respond with:  '<IP>,<MAC>,<name>'
     Kit 2.0 Cyber Security dongles respond with: 'dongle@sn,dtls_port:<port>,<serial>'
+    When busy with an active DTLS session: 'dongle@sn,dtls_port:<port>@busy,<serial>'
 
     Returns dict with keys: 'dtls' (bool), and either legacy or dtls fields.
+    'busy' key is True when the dongle already has an active DTLS session.
     """
     try:
         text = raw.decode("utf-8").strip()
@@ -48,12 +50,20 @@ def _parse_48899_response(raw: bytes) -> dict:
         parts = text.split(",")
         dtls_port = GOODWE_UDP_PORT
         serial = ""
+        busy = False
         for part in parts[1:]:
             if part.startswith("dtls_port:"):
-                dtls_port = int(part.split(":")[1])
+                port_field = part.split(":")[1]
+                if "@busy" in port_field:
+                    busy = True
+                    port_field = port_field.split("@")[0]
+                try:
+                    dtls_port = int(port_field)
+                except ValueError:
+                    pass
             else:
                 serial = part
-        return {"dtls": True, "dtls_port": dtls_port, "serial": serial, "raw": text}
+        return {"dtls": True, "busy": busy, "dtls_port": dtls_port, "serial": serial, "raw": text}
 
     # Legacy format: IP,MAC,name
     parts = text.split(",")
@@ -96,15 +106,27 @@ def _inverter_from_serial(
 async def _probe_48899(host: str, timeout: int = 3) -> dict | None:
     """Send discovery packet to port 48899 and parse the response.
 
+    Retries when the dongle responds with @busy (active DTLS session in progress).
     Returns parsed dict on success, None on failure.
     """
     command = ProtocolCommand(_DISCOVERY_48899_PAYLOAD.encode("utf-8"), lambda r: True)
-    try:
-        result = await command.execute(UdpInverterProtocol(host, 48899, timeout, 1))
-        if result is not None:
-            return _parse_48899_response(result.response_data())
-    except (InverterError, asyncio.CancelledError):
-        pass
+    for attempt in range(6):
+        try:
+            result = await command.execute(UdpInverterProtocol(host, 48899, timeout, 1))
+            if result is not None:
+                disc = _parse_48899_response(result.response_data())
+                if disc.get("busy"):
+                    logger.debug(
+                        "Dongle at %s is busy with an existing DTLS session (attempt %d/6), "
+                        "waiting 5s for it to release.",
+                        host, attempt + 1,
+                    )
+                    await asyncio.sleep(5)
+                    continue
+                return disc
+        except (InverterError, asyncio.CancelledError):
+            pass
+        break
     return None
 
 

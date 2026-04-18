@@ -400,12 +400,17 @@ class DtlsInverterProtocol(UdpInverterProtocol):
 
     DTLS_CIPHER = 'ECDHE-RSA-AES128-GCM-SHA256'
     SOCAT_STARTUP_DELAY = 0.5  # seconds to wait for socat to bind its UDP port
+    # Minimum gap between tearing down one DTLS session and starting the next.
+    # The dongle responds @busy on port 48899 if the previous session is still
+    # being cleaned up on its end.
+    DONGLE_SESSION_COOLDOWN = 3.0
 
     def __init__(self, host: str, port: int, comm_addr: int, timeout: int = 1, retries: int = 3):
         self._dtls_host = host
         self._dtls_port = port
         self._socat_proc: asyncio.subprocess.Process | None = None
         self._local_port = self._find_free_udp_port()
+        self._socat_terminated_at: float = 0.0
         # Connect the parent UDP protocol to the local socat proxy, keep socket alive
         super().__init__('127.0.0.1', self._local_port, comm_addr, timeout, retries)
         self.keep_alive = True
@@ -428,6 +433,7 @@ class DtlsInverterProtocol(UdpInverterProtocol):
         if self._socat_proc is not None:
             proc = self._socat_proc
             self._socat_proc = None
+            self._socat_terminated_at = asyncio.get_running_loop().time()
             proc.terminate()
             # Reap the process so it doesn't become a zombie.
             asyncio.get_running_loop().create_task(proc.wait())
@@ -436,6 +442,12 @@ class DtlsInverterProtocol(UdpInverterProtocol):
         """Start socat DTLS proxy and wait for it to bind to the local UDP port."""
         if self._socat_running():
             return
+        # Honour the dongle session cooldown — if a previous DTLS session was
+        # just torn down, wait before opening a new one so the dongle has time
+        # to release the session and stop responding @busy on port 48899.
+        elapsed = asyncio.get_running_loop().time() - self._socat_terminated_at
+        if elapsed < self.DONGLE_SESSION_COOLDOWN:
+            await asyncio.sleep(self.DONGLE_SESSION_COOLDOWN - elapsed)
         # rcvtimeo must be >= the inverter timeout so socat stays alive long enough
         # for HA's retry loop to fire before socat exits and closes the port.
         rcvtimeo = max(self.timeout, 2)
