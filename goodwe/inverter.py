@@ -478,8 +478,9 @@ class Inverter(ABC):
     def _decode(data: bytes) -> str:
         """Decode the bytes to ascii string"""
         try:
-            if any(x < 32 for x in data):
+            stripped = data.rstrip(b"\x00")
+            if any(x < 32 for x in stripped):
                 return data.decode("utf-16be").rstrip().replace("\x00", "")
-            return data.decode("ascii").rstrip()
+            return stripped.decode("ascii").rstrip()
         except ValueError:
             return data.hex()
